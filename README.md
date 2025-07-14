@@ -20,6 +20,8 @@ FramePack can be trained with a much larger batch size, similar to the batch siz
 
 # News
 
+**2025 July 14:** Some pure text2video anti-drifting stress-test results of FramePack-P1 are uploaded [here,](https://lllyasviel.github.io/frame_pack_gitpage/p1/#text-to-video-stress-tests) using common prompts without any reference images.
+
 **2025 June 26:** Some results of FramePack-P1 are uploaded [here.](https://lllyasviel.github.io/frame_pack_gitpage/p1) The FramePack-P1 will be the next version of FramePack with two designs: Planned Anti-Drifting and History Discretization.
 
 **2025 May 03:** The FramePack-F1 is released. [Try it here.](https://github.com/lllyasviel/FramePack/discussions/459)
