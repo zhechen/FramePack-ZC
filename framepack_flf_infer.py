@@ -43,6 +43,53 @@ from diffusers_helper.models.hunyuan_video_packed import HunyuanVideoTransformer
 from diffusers_helper.pipelines.k_diffusion_hunyuan import sample_hunyuan
 from diffusers_helper.utils import crop_or_pad_yield_mask, resize_and_center_crop, save_bcthw_as_mp4
 
+HAS_CUDA = torch.cuda.is_available()
+
+if HAS_CUDA:
+    from diffusers_helper.memory import (
+        DynamicSwapInstaller,
+        cpu,
+        fake_diffusers_current_device,
+        get_cuda_free_memory_gb,
+        gpu,
+        load_model_as_complete,
+        move_model_to_device_with_memory_preservation,
+        offload_model_from_device_for_memory_preservation,
+        unload_complete_models,
+    )
+else:
+    cpu = torch.device("cpu")
+    gpu = torch.device("cpu")
+
+    class _NoOpDynamicSwapInstaller:
+        @staticmethod
+        def install_model(*args, **kwargs):
+            return None
+
+        @staticmethod
+        def uninstall_model(*args, **kwargs):
+            return None
+
+    DynamicSwapInstaller = _NoOpDynamicSwapInstaller
+
+    def fake_diffusers_current_device(*args, **kwargs):
+        return None
+
+    def get_cuda_free_memory_gb(*args, **kwargs):
+        return 0.0
+
+    def move_model_to_device_with_memory_preservation(*args, **kwargs):
+        raise RuntimeError("CUDA is required for memory preservation moves.")
+
+    def offload_model_from_device_for_memory_preservation(*args, **kwargs):
+        raise RuntimeError("CUDA is required for memory preservation moves.")
+
+    def unload_complete_models(*args, **kwargs):
+        return None
+
+    def load_model_as_complete(*args, **kwargs):
+        raise RuntimeError("CUDA is required for memory preservation moves.")
+
 from framepack import flf_helpers
 from diffusers_helper.k_diffusion.uni_pc_fm import maybe_prepare_endpoints
 
@@ -51,6 +98,15 @@ from diffusers_helper.k_diffusion.uni_pc_fm import maybe_prepare_endpoints
 class EndpointPipeline:
     vae: AutoencoderKLHunyuanVideo
     scheduler: Optional[object] = None
+
+
+@dataclass
+class RuntimeConfig:
+    use_cuda: bool
+    high_vram: bool
+    device: torch.device
+    cpu_device: torch.device = cpu
+    gpu_memory_preservation: int = 6
 
 
 def parse_args() -> argparse.Namespace:
@@ -90,35 +146,59 @@ def setup_environment():
     os.environ.setdefault("HF_HOME", str(root / "hf_download"))
 
 
-def load_models(device: torch.device):
+def load_models(runtime: RuntimeConfig):
     text_encoder = LlamaModel.from_pretrained(
         "hunyuanvideo-community/HunyuanVideo", subfolder="text_encoder", torch_dtype=torch.float16
-    ).to(device)
+    ).cpu()
     text_encoder_2 = CLIPTextModel.from_pretrained(
         "hunyuanvideo-community/HunyuanVideo", subfolder="text_encoder_2", torch_dtype=torch.float16
-    ).to(device)
+    ).cpu()
     tokenizer = LlamaTokenizerFast.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder="tokenizer")
     tokenizer_2 = CLIPTokenizer.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder="tokenizer_2")
 
     vae = AutoencoderKLHunyuanVideo.from_pretrained(
         "hunyuanvideo-community/HunyuanVideo", subfolder="vae", torch_dtype=torch.float16
-    ).to(device)
-    vae.eval()
-    vae.requires_grad_(False)
+    ).cpu()
 
     feature_extractor = SiglipImageProcessor.from_pretrained("lllyasviel/flux_redux_bfl", subfolder="feature_extractor")
     image_encoder = SiglipVisionModel.from_pretrained(
         "lllyasviel/flux_redux_bfl", subfolder="image_encoder", torch_dtype=torch.float16
-    ).to(device)
-    image_encoder.eval()
-    image_encoder.requires_grad_(False)
+    ).cpu()
 
     transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained(
         "lllyasviel/FramePack_F1_I2V_HY_20250503", torch_dtype=torch.bfloat16
-    ).to(device)
-    transformer.eval()
-    transformer.requires_grad_(False)
+    ).cpu()
     transformer.high_quality_fp32_output_for_inference = True
+
+    transformer.to(dtype=torch.bfloat16)
+    vae.to(dtype=torch.float16)
+    image_encoder.to(dtype=torch.float16)
+    text_encoder.to(dtype=torch.float16)
+    text_encoder_2.to(dtype=torch.float16)
+
+    vae.eval()
+    text_encoder.eval()
+    text_encoder_2.eval()
+    image_encoder.eval()
+    transformer.eval()
+
+    vae.requires_grad_(False)
+    text_encoder.requires_grad_(False)
+    text_encoder_2.requires_grad_(False)
+    image_encoder.requires_grad_(False)
+    transformer.requires_grad_(False)
+
+    if runtime.use_cuda and runtime.high_vram:
+        text_encoder.to(runtime.device)
+        text_encoder_2.to(runtime.device)
+        image_encoder.to(runtime.device)
+        vae.to(runtime.device)
+        transformer.to(runtime.device)
+    elif runtime.use_cuda:
+        vae.enable_slicing()
+        vae.enable_tiling()
+        DynamicSwapInstaller.install_model(transformer, device=runtime.device)
+        DynamicSwapInstaller.install_model(text_encoder, device=runtime.device)
 
     return {
         "text_encoder": text_encoder,
@@ -132,7 +212,11 @@ def load_models(device: torch.device):
     }
 
 
-def encode_text(models, prompt: str, negative_prompt: str):
+def encode_text(models, runtime: RuntimeConfig, prompt: str, negative_prompt: str):
+    if runtime.use_cuda and not runtime.high_vram:
+        fake_diffusers_current_device(models["text_encoder"], runtime.device)
+        load_model_as_complete(models["text_encoder_2"], target_device=runtime.device)
+
     llama_vec, clip_pooler = encode_prompt_conds(
         prompt,
         models["text_encoder"],
@@ -154,6 +238,9 @@ def encode_text(models, prompt: str, negative_prompt: str):
     llama_vec, llama_mask = crop_or_pad_yield_mask(llama_vec, length=512)
     llama_neg, llama_mask_neg = crop_or_pad_yield_mask(llama_neg, length=512)
 
+    if runtime.use_cuda and not runtime.high_vram:
+        unload_complete_models(models["text_encoder_2"])
+
     return (
         llama_vec.to(models["transformer"].dtype),
         llama_mask,
@@ -164,22 +251,43 @@ def encode_text(models, prompt: str, negative_prompt: str):
     )
 
 
-def prepare_image_latent(models, input_path: str, height: int, width: int):
+def prepare_image_latent(models, runtime: RuntimeConfig, input_path: str, height: int, width: int):
     image = np.array(Image.open(input_path).convert("RGB"))
     prepared = resize_and_center_crop(image, target_width=width, target_height=height)
     tensor = torch.from_numpy(prepared).float() / 127.5 - 1.0
     tensor = tensor.permute(2, 0, 1)[None, :, None]
+    if runtime.use_cuda and not runtime.high_vram:
+        load_model_as_complete(models["vae"], target_device=runtime.device)
+        tensor = tensor.to(runtime.device)
+    else:
+        tensor = tensor.to(models["vae"].device)
+
     latent = vae_encode(tensor, models["vae"])
+
+    if runtime.use_cuda and not runtime.high_vram:
+        latent = latent.to(runtime.cpu_device)
+        unload_complete_models(models["vae"])
+
     return latent, prepared
 
 
-def prepare_clip_embedding(models, prepared_np):
+def prepare_clip_embedding(models, runtime: RuntimeConfig, prepared_np):
+    if runtime.use_cuda and not runtime.high_vram:
+        load_model_as_complete(models["image_encoder"], target_device=runtime.device)
+
     output = hf_clip_vision_encode(prepared_np, models["feature_extractor"], models["image_encoder"])
-    return output.last_hidden_state.to(models["transformer"].dtype)
+    hidden_state = output.last_hidden_state.to(models["transformer"].dtype)
+
+    if runtime.use_cuda and not runtime.high_vram:
+        hidden_state = hidden_state.to(runtime.cpu_device)
+        unload_complete_models(models["image_encoder"])
+
+    return hidden_state
 
 
 def run_sampler(
     models,
+    runtime: RuntimeConfig,
     args,
     llama_vec,
     llama_mask,
@@ -199,6 +307,22 @@ def run_sampler(
     latent_window_size = (args.frames + 3) // 4
     latent_window_size = max(latent_window_size, 4)
     frames = latent_window_size * 4 - 3
+
+    if runtime.use_cuda and not runtime.high_vram:
+        move_model_to_device_with_memory_preservation(
+            transformer, target_device=runtime.device, preserved_memory_gb=runtime.gpu_memory_preservation
+        )
+
+    device = runtime.device if runtime.use_cuda else runtime.cpu_device
+
+    llama_vec = llama_vec.to(device)
+    llama_mask = llama_mask.to(device) if isinstance(llama_mask, torch.Tensor) else llama_mask
+    llama_neg = llama_neg.to(device)
+    llama_mask_neg = llama_mask_neg.to(device) if isinstance(llama_mask_neg, torch.Tensor) else llama_mask_neg
+    clip_pooler = clip_pooler.to(device)
+    clip_neg = clip_neg.to(device)
+    clip_vision = clip_vision.to(device)
+    start_latent = start_latent.to(device)
 
     indices = torch.arange(0, sum([1, 16, 2, 1, latent_window_size])).unsqueeze(0)
     _, clean_latent_4x_indices, clean_latent_2x_indices, clean_latent_1x_indices, latent_indices = indices.split(
@@ -247,6 +371,11 @@ def run_sampler(
         endpoint_pipeline=endpoint_pipeline,
     )
 
+    if runtime.use_cuda and not runtime.high_vram:
+        result = result.to(runtime.cpu_device)
+        offload_model_from_device_for_memory_preservation(transformer, target_device=runtime.device, preserved_memory_gb=8)
+        unload_complete_models()
+
     return result, frames
 
 
@@ -256,9 +385,19 @@ def _format_duration(num_frames: int, fps: int) -> str:
         return f"{int(seconds)}s"
     return f"{seconds:.2f}s"
 
-def decode_and_save(models, latents, output_path: str, fps: int = 30):
+def decode_and_save(models, runtime: RuntimeConfig, latents, output_path: str, fps: int = 30):
     duration_label = _format_duration(latents.shape[2], fps)
+    if runtime.use_cuda and not runtime.high_vram:
+        load_model_as_complete(models["vae"], target_device=runtime.device)
+        latents = latents.to(runtime.device)
+    else:
+        latents = latents.to(models["vae"].device)
+
     pixels = vae_decode(latents, models["vae"]).cpu()
+
+    if runtime.use_cuda and not runtime.high_vram:
+        unload_complete_models(models["vae"])
+
     save_bcthw_as_mp4(pixels, output_path, fps=fps, crf=16)
     print(f"Saved {duration_label} video to {output_path}")
 
@@ -267,18 +406,29 @@ def main():
     setup_environment()
     args = parse_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    models = load_models(device)
+    use_cuda = HAS_CUDA
+    device = gpu if use_cuda else cpu
+
+    high_vram = True
+    if use_cuda:
+        free_mem_gb = get_cuda_free_memory_gb(device)
+        high_vram = free_mem_gb > 60
+        print(f"Free VRAM {free_mem_gb:.2f} GB")
+        print(f"High-VRAM Mode: {high_vram}")
+
+    runtime = RuntimeConfig(use_cuda=use_cuda, high_vram=high_vram, device=device)
+
+    models = load_models(runtime)
 
     llama_vec, llama_mask, clip_pooler, llama_neg, llama_mask_neg, clip_neg = encode_text(
-        models, args.prompt, args.negative_prompt
+        models, runtime, args.prompt, args.negative_prompt
     )
 
     # Align spatial resolution to the model buckets.
     input_image = Image.open(args.input_image).convert("RGB")
     bucket_h, bucket_w = find_nearest_bucket(*input_image.size[::-1], resolution=640)
-    start_latent, prepared_np = prepare_image_latent(models, args.input_image, bucket_h, bucket_w)
-    clip_vision = prepare_clip_embedding(models, prepared_np)
+    start_latent, prepared_np = prepare_image_latent(models, runtime, args.input_image, bucket_h, bucket_w)
+    clip_vision = prepare_clip_embedding(models, runtime, prepared_np)
 
     endpoint_cfg = {
         "start_frame": args.start_frame,
@@ -300,6 +450,7 @@ def main():
 
     forward_latents, _ = run_sampler(
         models,
+        runtime,
         args,
         llama_vec,
         llama_mask,
@@ -325,6 +476,7 @@ def main():
         )
         backward_latents, _ = run_sampler(
             models,
+            runtime,
             args,
             llama_vec,
             llama_mask,
@@ -351,7 +503,7 @@ def main():
     fps = 30
     duration_label = _format_duration(latents.shape[2], fps)
     print(f"Generated a {duration_label} clip with endpoint controls.")
-    decode_and_save(models, latents, args.output, fps=fps)
+    decode_and_save(models, runtime, latents, args.output, fps=fps)
 
 
 
