@@ -31,10 +31,41 @@ def _pil_to_tensor(image: Image.Image) -> torch.Tensor:
     return tensor
 
 
+def _ensure_temporal_dim(vae, tensor: torch.Tensor) -> torch.Tensor:
+    """Expand ``tensor`` with a temporal dimension for video VAEs."""
+
+    if tensor.ndim != 4:
+        return tensor
+
+    config = getattr(vae, "config", None)
+    sample_size = None
+    if config is not None:
+        for attr in ("sample_size", "spatial_sample_size"):
+            sample_size = getattr(config, attr, None)
+            if sample_size is not None:
+                break
+
+    if sample_size is None:
+        return tensor
+
+    if isinstance(sample_size, int):
+        dims = (sample_size,)
+    else:
+        try:
+            dims = tuple(sample_size)
+        except TypeError:
+            return tensor
+
+    if len(dims) == 3:
+        tensor = tensor.unsqueeze(2)
+    return tensor
+
+
 def encode_vae(vae, image: Image.Image, device: torch.device, scale: float) -> torch.Tensor:
     """Encode an image with a VAE and return a latent scaled by ``scale``."""
 
     tensor = _pil_to_tensor(image).to(device=device, dtype=vae.dtype)
+    tensor = _ensure_temporal_dim(vae, tensor)
     encoded = vae.encode(tensor).latent_dist
     if hasattr(encoded, "mode"):
         latent = encoded.mode()
