@@ -4,11 +4,13 @@
 # Attribution-ShareAlike 4.0 International Licence
 
 
+import sys
+
 import torch
 
 from typing import Any, Dict, Optional
 
-from tqdm.auto import trange
+from tqdm import trange
 
 from framepack import flf_helpers
 
@@ -222,7 +224,13 @@ class FlowMatchUniPC:
     def sample(self, x, sigmas, callback=None, disable_pbar=False):
         order = min(3, len(sigmas) - 2)
         model_prev_list, t_prev_list = [], []
-        for i in trange(len(sigmas) - 1, disable=disable_pbar):
+        for i in trange(
+            len(sigmas) - 1,
+            disable=disable_pbar,
+            leave=True,
+            dynamic_ncols=True,
+            file=sys.stdout,
+        ):
             vec_t = sigmas[i].expand(x.shape[0])
 
             if i == 0:
