@@ -256,7 +256,6 @@ def _format_duration(num_frames: int, fps: int) -> str:
         return f"{int(seconds)}s"
     return f"{seconds:.2f}s"
 
-
 def decode_and_save(models, latents, output_path: str, fps: int = 30):
     duration_label = _format_duration(latents.shape[2], fps)
     pixels = vae_decode(latents, models["vae"]).cpu()
@@ -353,6 +352,7 @@ def main():
     duration_label = _format_duration(latents.shape[2], fps)
     print(f"Generated a {duration_label} clip with endpoint controls.")
     decode_and_save(models, latents, args.output, fps=fps)
+
 
 
 if __name__ == "__main__":
