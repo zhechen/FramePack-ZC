@@ -51,6 +51,8 @@ def sample_hunyuan(
         device=None,
         negative_kwargs=None,
         callback=None,
+        endpoint_context=None,
+        endpoint_pipeline=None,
         **kwargs,
 ):
     device = device or transformer.device
@@ -113,7 +115,16 @@ def sample_hunyuan(
     )
 
     if sampler == 'unipc':
-        results = sample_unipc(k_model, latents, sigmas, extra_args=sampler_kwargs, disable=False, callback=callback)
+        results = sample_unipc(
+            k_model,
+            latents,
+            sigmas,
+            extra_args=sampler_kwargs,
+            disable=False,
+            callback=callback,
+            pipeline=endpoint_pipeline,
+            endpoint_context=endpoint_context,
+        )
     else:
         raise NotImplementedError(f'Sampler {sampler} is not supported.')
 
