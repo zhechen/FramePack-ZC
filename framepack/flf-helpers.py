@@ -37,26 +37,22 @@ def _ensure_temporal_dim(vae, tensor: torch.Tensor) -> torch.Tensor:
     if tensor.ndim != 4:
         return tensor
 
-    config = getattr(vae, "config", None)
-    sample_size = None
-    if config is not None:
-        for attr in ("sample_size", "spatial_sample_size"):
-            sample_size = getattr(config, attr, None)
-            if sample_size is not None:
-                break
-
-    if sample_size is None:
-        return tensor
-
-    if isinstance(sample_size, int):
-        dims = (sample_size,)
-    else:
+    def _ratio_gt_one(value) -> bool:
         try:
-            dims = tuple(sample_size)
-        except TypeError:
-            return tensor
+            return float(value) > 1
+        except (TypeError, ValueError):
+            return False
 
-    if len(dims) == 3:
+    config = getattr(vae, "config", None)
+    has_temporal_compression = False
+    if config is not None and _ratio_gt_one(getattr(config, "temporal_compression_ratio", 1)):
+        has_temporal_compression = True
+    elif _ratio_gt_one(getattr(vae, "temporal_compression_ratio", None)):
+        has_temporal_compression = True
+    elif hasattr(vae, "time_compression_ratio"):
+        has_temporal_compression = True
+
+    if has_temporal_compression:
         tensor = tensor.unsqueeze(2)
     return tensor
 
