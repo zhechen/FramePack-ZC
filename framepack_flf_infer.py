@@ -17,7 +17,9 @@ end frames without any fine-tuning.
 from __future__ import annotations
 
 import argparse
+import math
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -137,6 +139,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cfg", type=float, default=1.0, help="Real guidance scale")
     parser.add_argument("--gs", type=float, default=10.0, help="Distilled guidance scale")
     parser.add_argument("--rs", type=float, default=0.0, help="Guidance rescale factor")
+    parser.add_argument(
+        "--section-pause",
+        type=float,
+        default=0.0,
+        help="Optional pause (in seconds) to insert between section samples to avoid GPU overload",
+    )
     parser.add_argument("--output", default="./outputs/flf.mp4", help="Where to save the resulting MP4")
     return parser.parse_args()
 
@@ -307,6 +315,9 @@ def run_sampler(
     latent_window_size = (args.frames + 3) // 4
     latent_window_size = max(latent_window_size, 4)
     frames = latent_window_size * 4 - 3
+    context_length = sum([16, 2, 1])
+    target_total_frames = max(args.frames, 1)
+    total_latent_sections = max(math.ceil(max(args.frames - 1, 0) / latent_window_size), 1)
 
     if runtime.use_cuda and not runtime.high_vram:
         move_model_to_device_with_memory_preservation(
@@ -322,61 +333,94 @@ def run_sampler(
     clip_pooler = clip_pooler.to(device)
     clip_neg = clip_neg.to(device)
     clip_vision = clip_vision.to(device)
-    start_latent = start_latent.to(device)
+    start_latent = start_latent.to(device=device, dtype=torch.float32)
 
-    indices = torch.arange(0, sum([1, 16, 2, 1, latent_window_size])).unsqueeze(0)
-    _, clean_latent_4x_indices, clean_latent_2x_indices, clean_latent_1x_indices, latent_indices = indices.split(
-        [1, 16, 2, 1, latent_window_size], dim=1
+    indices = torch.arange(0, sum([1, 16, 2, 1, latent_window_size]), device=device).unsqueeze(0)
+    (
+        clean_latent_indices_start,
+        clean_latent_4x_indices,
+        clean_latent_2x_indices,
+        clean_latent_1x_indices,
+        latent_indices,
+    ) = indices.split([1, 16, 2, 1, latent_window_size], dim=1)
+    clean_latent_indices = torch.cat([clean_latent_indices_start, clean_latent_1x_indices], dim=1)
+
+    history_latents = torch.zeros(
+        start_latent.shape[0],
+        start_latent.shape[1],
+        context_length,
+        height // 8,
+        width // 8,
+        dtype=torch.float32,
+        device=device,
     )
-    clean_latent_indices = torch.cat([torch.zeros_like(clean_latent_1x_indices[:, :1]), clean_latent_1x_indices], dim=1)
-
-    clean_latents_4x = start_latent[:, :, :16]
-    clean_latents_2x = start_latent[:, :, 16:18]
-    clean_latents_1x = start_latent[:, :, 18:19]
-
-    concat_latents = torch.cat([start_latent[:, :, :1], clean_latents_1x], dim=2)
+    history_latents = torch.cat([history_latents, start_latent], dim=2)
+    total_generated_latent_frames = 1
+    start_anchor = start_latent[:, :, :1]
 
     endpoint_pipeline = EndpointPipeline(models["vae"])
-    if endpoint_context is not None:
-        endpoint_context["total_frames"] = frames
 
-    result = sample_hunyuan(
-        transformer=transformer,
-        sampler="unipc",
-        width=width,
-        height=height,
-        frames=frames,
-        real_guidance_scale=args.cfg,
-        distilled_guidance_scale=args.gs,
-        guidance_rescale=args.rs,
-        num_inference_steps=args.steps,
-        generator=generator,
-        prompt_embeds=llama_vec,
-        prompt_embeds_mask=llama_mask,
-        prompt_poolers=clip_pooler,
-        negative_prompt_embeds=llama_neg,
-        negative_prompt_embeds_mask=llama_mask_neg,
-        negative_prompt_poolers=clip_neg,
-        device=transformer.device,
-        dtype=torch.bfloat16,
-        image_embeddings=clip_vision,
-        latent_indices=latent_indices,
-        clean_latents=concat_latents,
-        clean_latent_indices=clean_latent_indices,
-        clean_latents_2x=clean_latents_2x,
-        clean_latent_2x_indices=clean_latent_2x_indices,
-        clean_latents_4x=clean_latents_4x,
-        clean_latent_4x_indices=clean_latent_4x_indices,
-        endpoint_context=endpoint_context,
-        endpoint_pipeline=endpoint_pipeline,
-    )
+    for section_index in range(total_latent_sections):
+        if endpoint_context is not None:
+            endpoint_context["frame_idx"] = min(total_generated_latent_frames - 1, target_total_frames - 1)
+            endpoint_context["total_frames"] = target_total_frames
+
+        clean_latents_4x, clean_latents_2x, clean_latents_1x = history_latents[:, :, -context_length:, :, :].split(
+            [16, 2, 1], dim=2
+        )
+        clean_latents = torch.cat([start_anchor, clean_latents_1x], dim=2)
+
+        generated_latents = sample_hunyuan(
+            transformer=transformer,
+            sampler="unipc",
+            width=width,
+            height=height,
+            frames=frames,
+            real_guidance_scale=args.cfg,
+            distilled_guidance_scale=args.gs,
+            guidance_rescale=args.rs,
+            num_inference_steps=args.steps,
+            generator=generator,
+            prompt_embeds=llama_vec,
+            prompt_embeds_mask=llama_mask,
+            prompt_poolers=clip_pooler,
+            negative_prompt_embeds=llama_neg,
+            negative_prompt_embeds_mask=llama_mask_neg,
+            negative_prompt_poolers=clip_neg,
+            device=transformer.device,
+            dtype=torch.bfloat16,
+            image_embeddings=clip_vision,
+            latent_indices=latent_indices,
+            clean_latents=clean_latents,
+            clean_latent_indices=clean_latent_indices,
+            clean_latents_2x=clean_latents_2x,
+            clean_latent_2x_indices=clean_latent_2x_indices,
+            clean_latents_4x=clean_latents_4x,
+            clean_latent_4x_indices=clean_latent_4x_indices,
+            endpoint_context=endpoint_context,
+            endpoint_pipeline=endpoint_pipeline,
+        )
+
+        history_latents = torch.cat([history_latents, generated_latents.to(history_latents)], dim=2)
+        total_generated_latent_frames += int(generated_latents.shape[2])
+
+        if runtime.use_cuda and args.section_pause > 0:
+            torch.cuda.synchronize(device)
+            time.sleep(args.section_pause)
+
+        if total_generated_latent_frames >= target_total_frames:
+            break
+
+    latents = history_latents[:, :, -total_generated_latent_frames:, :, :]
+    if target_total_frames > 0:
+        latents = latents[:, :, :target_total_frames, :, :]
 
     if runtime.use_cuda and not runtime.high_vram:
-        result = result.to(runtime.cpu_device)
+        latents = latents.to(runtime.cpu_device)
         offload_model_from_device_for_memory_preservation(transformer, target_device=runtime.device, preserved_memory_gb=8)
         unload_complete_models()
 
-    return result, frames
+    return latents, int(latents.shape[2])
 
 
 def _format_duration(num_frames: int, fps: int) -> str:
