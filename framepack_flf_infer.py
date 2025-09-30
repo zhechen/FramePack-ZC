@@ -250,10 +250,17 @@ def run_sampler(
     return result, frames
 
 
+def _format_duration(num_frames: int, fps: int) -> str:
+    seconds = num_frames / float(fps)
+    if num_frames % fps == 0:
+        return f"{int(seconds)}s"
+    return f"{seconds:.2f}s"
+
 def decode_and_save(models, latents, output_path: str, fps: int = 30):
+    duration_label = _format_duration(latents.shape[2], fps)
     pixels = vae_decode(latents, models["vae"]).cpu()
     save_bcthw_as_mp4(pixels, output_path, fps=fps, crf=16)
-    print(f"Saved video to {output_path}")
+    print(f"Saved {duration_label} video to {output_path}")
 
 
 def main():
@@ -341,7 +348,11 @@ def main():
                     latents[:, :, -overlap + i], backward_latents[:, :, -overlap + i], alpha
                 )
 
-    decode_and_save(models, latents, args.output)
+    fps = 30
+    duration_label = _format_duration(latents.shape[2], fps)
+    print(f"Generated a {duration_label} clip with endpoint controls.")
+    decode_and_save(models, latents, args.output, fps=fps)
+
 
 
 if __name__ == "__main__":
